@@ -1,18 +1,19 @@
-from flask import Flask, request, render_template, flash, redirect, url_for  # Import flash
+from flask import Flask, request, render_template, flash, redirect, url_for
 import nltk
-from textblob import TextBlob
-from newspaper import Article
-from datetime import datetime
+import trafilatura
 from urllib.parse import urlparse
 import validators
 import requests
+import json
+from translator import translate_to_english
+from bs4 import BeautifulSoup
 
 nltk.download('punkt')
 
 app = Flask(__name__)
+app.secret_key = 'your_secret_key'
 
 def get_website_name(url):
-    # Extract the website name from the URL
     parsed_url = urlparse(url)
     domain = parsed_url.netloc
     if domain.startswith("www."):
@@ -23,57 +24,63 @@ def get_website_name(url):
 def index():
     if request.method == 'POST':
         url = request.form['url']
-        # Check if the input is a valid URL
 
         if not validators.url(url):
             flash('Please enter a valid URL.')
             return redirect(url_for('index'))
-        
+
         try:
-            response = requests.get(url)
-            response.raise_for_status()  # Raise an HTTPError if the HTTP request returned an unsuccessful status code
-        except requests.RequestException:
-            flash('Failed to download the content of the URL.')
-            return redirect(url_for('index'))
-        
-        article = Article(url)
-        article.download()
-        article.parse()
-        article.nlp()  # Perform natural language processing
+            downloaded_html = trafilatura.fetch_url(url)
+            if not downloaded_html:
+                flash("Could not download the article.")
+                return redirect(url_for('index'))
 
-        title = article.title
-        authors = ', '.join(article.authors)
-        if not authors:
-            authors = get_website_name(url)  # Set the author field to the website name
-        publish_date = article.publish_date.strftime('%B %d, %Y') if article.publish_date else "N/A"
+            extracted = trafilatura.extract(downloaded_html, include_images=True, output_format='json')
+            if not extracted:
+                flash("Could not extract article content.")
+                return redirect(url_for('index'))
 
-        # Manually adjust the summary length by selecting a certain number of sentences
-        article_text = article.text
-        sentences = article_text.split('.')
-        max_summarized_sentences = 5  # Adjust the number of sentences as needed
-        summary = '.'.join(sentences[:max_summarized_sentences])
+            data = json.loads(extracted)
+            article_text = data.get('text', '')
+            title = data.get('title', '').strip()
+            if title.lower() == 'untitled':
+                title = ''
+            authors = get_website_name(url)
 
-        top_image = article.top_image  # Get the top image URL
+            # Image logic
+            top_image = data.get('image', '')
+            if not top_image:
+                soup = BeautifulSoup(downloaded_html, 'html.parser')
+                og_image = soup.find('meta', property='og:image')
+                if og_image and og_image.get('content'):
+                    top_image = og_image['content']
 
-        analysis = TextBlob(article.text)
-        polarity = analysis.sentiment.polarity  # Get the polarity value
-
-        if summary == "":
-            flash('Please enter a valid URL.')
+        except Exception as e:
+            print("Extraction error:", e)
+            flash("Error extracting content.")
             return redirect(url_for('index'))
 
-        if polarity > 0:
-            sentiment = 'happy 😊'
-        elif polarity < 0:
-            sentiment = ' sad 😟'
-        else:
-            sentiment = 'neutral 😐'
+        if not article_text.strip():
+            flash("Could not extract article content.")
+            return redirect(url_for('index'))
 
-        return render_template('index.html', title=title, authors=authors, publish_date=publish_date, summary=summary, top_image=top_image, sentiment=sentiment)
+        try:
+            sentences = nltk.sent_tokenize(article_text)
+            original_summary = ' '.join(sentences[:5])
+            translated_summary = translate_to_english(original_summary)
+        except Exception as e:
+            print("Translation error:", e)
+            flash("Translation failed.")
+            return redirect(url_for('index'))
+
+        if not translated_summary.strip():
+            flash("Summary translation returned empty.")
+            return redirect(url_for('index'))
+
+        return render_template('index.html', title=title, authors=authors,
+                               summary_en=translated_summary,
+                               summary_original=original_summary, top_image=top_image)
 
     return render_template('index.html')
-
-app.secret_key = 'your_secret_key'
-
 if __name__ == '__main__':
     app.run(debug=True)
